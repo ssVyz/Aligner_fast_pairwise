@@ -92,6 +92,7 @@ struct AlignmentSettings {
     gap_extend_score: i32,
     min_oligos_matched: usize,
     min_coverage: f64,
+    ambiguity_display: AmbiguityDisplayMode,
 }
 
 impl Default for AlignmentSettings {
@@ -104,6 +105,7 @@ impl Default for AlignmentSettings {
             gap_extend_score: -1,
             min_oligos_matched: 1,
             min_coverage: 0.8,
+            ambiguity_display: AmbiguityDisplayMode::ShowBases,
         }
     }
 }
@@ -112,6 +114,12 @@ impl Default for AlignmentSettings {
 enum AlignmentMode {
     Local,
     Global,
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Serialize, Deserialize)]
+enum AmbiguityDisplayMode {
+    ShowBases,
+    ShowDots,
 }
 
 /// Analysis results
@@ -339,6 +347,18 @@ fn get_alignment_coverage(alignment: &bio::alignment::Alignment, oligo_len: usiz
     aligned_length as f64 / oligo_len as f64
 }
 
+/// Check if two nucleotides are an exact match (not just IUPAC ambiguity match)
+fn is_exact_match(a: u8, b: u8) -> bool {
+    let a_upper = a.to_ascii_uppercase();
+    let b_upper = b.to_ascii_uppercase();
+    
+    // Normalize U to T for comparison
+    let normalized_a = if a_upper == b'U' { b'T' } else { a_upper };
+    let normalized_b = if b_upper == b'U' { b'T' } else { b_upper };
+    
+    normalized_a == normalized_b
+}
+
 /// Generate signature from alignment
 /// For reverse orientation hits, the pattern is reversed to match the original oligo orientation
 fn generate_signature(
@@ -346,12 +366,14 @@ fn generate_signature(
     target_seq: &str,
     oligo_seq: &str,
     orientation: Orientation,
+    ambiguity_display: AmbiguityDisplayMode,
 ) -> (String, usize) {
     let oligo_len = oligo_seq.len();
     let mut sig: Vec<char> = vec!['-'; oligo_len];
     let mut mismatches = 0;
 
     let target_bytes = target_seq.as_bytes();
+    let oligo_bytes = oligo_seq.as_bytes();
 
     let mut t_pos = alignment.xstart;
     let mut q_pos = alignment.ystart;
@@ -360,7 +382,24 @@ fn generate_signature(
         match op {
             AlignmentOperation::Match => {
                 if q_pos < oligo_len && t_pos < target_bytes.len() {
-                    sig[q_pos] = '.';
+                    let target_base = target_bytes[t_pos];
+                    let oligo_base = oligo_bytes[q_pos];
+                    
+                    // Check if it's an exact match or ambiguity match
+                    if is_exact_match(target_base, oligo_base) {
+                        sig[q_pos] = '.';
+                    } else {
+                        // It's an ambiguity match
+                        match ambiguity_display {
+                            AmbiguityDisplayMode::ShowDots => {
+                                sig[q_pos] = '.';
+                            }
+                            AmbiguityDisplayMode::ShowBases => {
+                                sig[q_pos] = target_bytes[t_pos] as char;
+                                mismatches += 1;
+                            }
+                        }
+                    }
                 }
                 t_pos += 1;
                 q_pos += 1;
@@ -444,7 +483,7 @@ fn analyze_sequence(
         {
             if is_valid_alignment(&alignment, actual_oligo.len(), settings.min_coverage) {
                 let (signature, mismatches) =
-                    generate_signature(&alignment, &sequence.seq, &actual_oligo, orientation);
+                    generate_signature(&alignment, &sequence.seq, &actual_oligo, orientation, settings.ambiguity_display);
                 let coverage = get_alignment_coverage(&alignment, actual_oligo.len());
 
                 total_matched += 1;
@@ -1308,6 +1347,29 @@ impl eframe::App for PrimerAlignApp {
                         self.show_advanced_settings = true;
                     }
                 });
+                
+                ui.add_space(5.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Ambiguity Match Display:");
+                    egui::ComboBox::from_id_salt("ambiguity_display")
+                        .selected_text(match self.settings.ambiguity_display {
+                            AmbiguityDisplayMode::ShowBases => "Show Base Letters",
+                            AmbiguityDisplayMode::ShowDots => "Show Dots",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.settings.ambiguity_display,
+                                AmbiguityDisplayMode::ShowBases,
+                                "Show Base Letters",
+                            );
+                            ui.selectable_value(
+                                &mut self.settings.ambiguity_display,
+                                AmbiguityDisplayMode::ShowDots,
+                                "Show Dots",
+                            );
+                        });
+                });
             });
 
             ui.add_space(15.0);
@@ -1460,6 +1522,26 @@ impl eframe::App for PrimerAlignApp {
                                 .speed(0.01)
                                 .max_decimals(2),
                         );
+                        ui.end_row();
+
+                        ui.label("Ambiguity Match Display:");
+                        egui::ComboBox::from_id_salt("ambiguity_display_adv")
+                            .selected_text(match self.settings.ambiguity_display {
+                                AmbiguityDisplayMode::ShowBases => "Show Base Letters",
+                                AmbiguityDisplayMode::ShowDots => "Show Dots",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.ambiguity_display,
+                                    AmbiguityDisplayMode::ShowBases,
+                                    "Show Base Letters",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.ambiguity_display,
+                                    AmbiguityDisplayMode::ShowDots,
+                                    "Show Dots",
+                                );
+                            });
                         ui.end_row();
                     });
 
