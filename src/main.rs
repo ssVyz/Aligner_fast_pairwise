@@ -1,0 +1,1494 @@
+//! qPCR Primer Inclusivity Analysis Tool
+//! A fast Rust implementation with eframe GUI
+//!
+//! This tool evaluates primer inclusivity in large sets of reference sequences
+//! using pairwise alignment from rust-bio.
+
+use bio::alignment::pairwise::{Aligner, Scoring};
+use bio::alignment::AlignmentOperation;
+use bio::io::fasta;
+use eframe::egui;
+use rayon::prelude::*;
+use rfd::FileDialog;
+use rust_xlsxwriter::{Format, Workbook};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+/// A FASTA record with id and sequence
+#[derive(Clone, Debug)]
+struct FastaRecord {
+    id: String,
+    seq: String,
+}
+
+/// Oligo/Primer sequence with id
+#[derive(Clone, Debug)]
+struct Oligo {
+    id: String,
+    seq: String,
+}
+
+/// Result of aligning an oligo to a sequence
+#[derive(Clone, Debug)]
+struct OligoResult {
+    matched: bool,
+    orientation: Option<Orientation>,
+    signature: String,
+    mismatches: usize,
+    score: i32,
+    coverage: f64,
+}
+
+/// Orientation of the oligo match
+#[derive(Clone, Debug, Copy, PartialEq)]
+enum Orientation {
+    Sense,
+    Antisense,
+}
+
+impl std::fmt::Display for Orientation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Orientation::Sense => write!(f, "fwd"),
+            Orientation::Antisense => write!(f, "rev"),
+        }
+    }
+}
+
+/// Aggregated pattern data
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PatternData {
+    count: usize,
+    total_mismatches: usize,
+    matched_oligos: usize,
+    examples: Vec<String>,
+}
+
+/// Oligo match statistics
+#[derive(Clone, Debug, Default)]
+struct OligoStats {
+    total_matches: usize,
+    sense_matches: usize,
+    antisense_matches: usize,
+}
+
+/// Alignment settings
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AlignmentSettings {
+    mode: AlignmentMode,
+    match_score: i32,
+    mismatch_score: i32,
+    gap_open_score: i32,
+    gap_extend_score: i32,
+    min_oligos_matched: usize,
+    min_coverage: f64,
+}
+
+impl Default for AlignmentSettings {
+    fn default() -> Self {
+        Self {
+            mode: AlignmentMode::Local,
+            match_score: 2,
+            mismatch_score: -1,
+            gap_open_score: -2,
+            gap_extend_score: -1,
+            min_oligos_matched: 1,
+            min_coverage: 0.8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Serialize, Deserialize)]
+enum AlignmentMode {
+    Local,
+    Global,
+}
+
+/// Analysis results
+#[derive(Clone, Debug, Default)]
+struct AnalysisResults {
+    alignment_dict: HashMap<String, PatternData>,
+    oligo_stats: HashMap<String, OligoStats>,
+    total_sequences: usize,
+    sequences_with_min_matches: usize,
+    output_text: String,
+}
+
+/// Progress tracking for analysis
+#[derive(Clone)]
+struct ProgressTracker {
+    current: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+    status: Arc<Mutex<String>>,
+    running: Arc<AtomicBool>,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            current: Arc::new(AtomicUsize::new(0)),
+            total: Arc::new(AtomicUsize::new(0)),
+            status: Arc::new(Mutex::new("Ready".to_string())),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+// ============================================================================
+// Bioinformatics Functions
+// ============================================================================
+
+/// Get reverse complement of a DNA sequence
+fn reverse_complement(seq: &str) -> String {
+    seq.chars()
+        .rev()
+        .map(|c| match c.to_ascii_uppercase() {
+            'A' => 'T',
+            'T' => 'A',
+            'G' => 'C',
+            'C' => 'G',
+            'U' => 'A',
+            'R' => 'Y',
+            'Y' => 'R',
+            'S' => 'S',
+            'W' => 'W',
+            'K' => 'M',
+            'M' => 'K',
+            'B' => 'V',
+            'D' => 'H',
+            'H' => 'D',
+            'V' => 'B',
+            'N' => 'N',
+            _ => 'N',
+        })
+        .collect()
+}
+
+/// Parse a FASTA file and return records
+fn parse_fasta(path: &PathBuf) -> Result<Vec<FastaRecord>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let reader = fasta::Reader::new(BufReader::new(file));
+
+    let mut records = Vec::new();
+    for result in reader.records() {
+        match result {
+            Ok(record) => {
+                let id = record.id().to_string();
+                let seq = std::str::from_utf8(record.seq())
+                    .map_err(|e| format!("Invalid UTF-8 in sequence: {}", e))?
+                    .to_uppercase()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                records.push(FastaRecord { id, seq });
+            }
+            Err(e) => return Err(format!("Error reading FASTA record: {}", e)),
+        }
+    }
+    Ok(records)
+}
+
+/// Perform alignment and return best alignment with orientation
+fn get_best_alignment(
+    target_seq: &str,
+    oligo_seq: &str,
+    settings: &AlignmentSettings,
+) -> (Option<bio::alignment::Alignment>, Option<Orientation>, String) {
+    let scoring = Scoring::new(
+        settings.gap_open_score,
+        settings.gap_extend_score,
+        |a: u8, b: u8| {
+            if a == b {
+                settings.match_score
+            } else {
+                settings.mismatch_score
+            }
+        },
+    );
+
+    let target_bytes = target_seq.as_bytes();
+    let oligo_bytes = oligo_seq.as_bytes();
+    let oligo_rc = reverse_complement(oligo_seq);
+    let oligo_rc_bytes = oligo_rc.as_bytes();
+
+    let mut aligner = Aligner::with_capacity_and_scoring(
+        target_bytes.len(),
+        oligo_bytes.len(),
+        scoring.clone(),
+    );
+
+    // Try sense orientation
+    let alignment_sense = match settings.mode {
+        AlignmentMode::Local => aligner.local(target_bytes, oligo_bytes),
+        AlignmentMode::Global => aligner.global(target_bytes, oligo_bytes),
+    };
+
+    // Try antisense orientation
+    let alignment_antisense = match settings.mode {
+        AlignmentMode::Local => aligner.local(target_bytes, oligo_rc_bytes),
+        AlignmentMode::Global => aligner.global(target_bytes, oligo_rc_bytes),
+    };
+
+    // Return the better scoring alignment
+    if alignment_sense.score >= alignment_antisense.score {
+        (
+            Some(alignment_sense),
+            Some(Orientation::Sense),
+            oligo_seq.to_string(),
+        )
+    } else {
+        (
+            Some(alignment_antisense),
+            Some(Orientation::Antisense),
+            oligo_rc,
+        )
+    }
+}
+
+/// Check if alignment is valid based on coverage criteria
+fn is_valid_alignment(
+    alignment: &bio::alignment::Alignment,
+    oligo_len: usize,
+    min_coverage: f64,
+) -> bool {
+    let aligned_length = alignment
+        .operations
+        .iter()
+        .filter(|op| matches!(op, AlignmentOperation::Match | AlignmentOperation::Subst))
+        .count();
+
+    let coverage = aligned_length as f64 / oligo_len as f64;
+    coverage >= min_coverage
+}
+
+/// Calculate alignment coverage
+fn get_alignment_coverage(alignment: &bio::alignment::Alignment, oligo_len: usize) -> f64 {
+    let aligned_length = alignment
+        .operations
+        .iter()
+        .filter(|op| matches!(op, AlignmentOperation::Match | AlignmentOperation::Subst))
+        .count();
+
+    aligned_length as f64 / oligo_len as f64
+}
+
+/// Generate signature from alignment
+fn generate_signature(
+    alignment: &bio::alignment::Alignment,
+    target_seq: &str,
+    oligo_seq: &str,
+) -> (String, usize) {
+    let oligo_len = oligo_seq.len();
+    let mut sig: Vec<char> = vec!['-'; oligo_len];
+    let mut mismatches = 0;
+
+    let target_bytes = target_seq.as_bytes();
+
+    let mut t_pos = alignment.xstart;
+    let mut q_pos = alignment.ystart;
+
+    for op in &alignment.operations {
+        match op {
+            AlignmentOperation::Match => {
+                if q_pos < oligo_len && t_pos < target_bytes.len() {
+                    sig[q_pos] = '.';
+                }
+                t_pos += 1;
+                q_pos += 1;
+            }
+            AlignmentOperation::Subst => {
+                if q_pos < oligo_len && t_pos < target_bytes.len() {
+                    sig[q_pos] = target_bytes[t_pos] as char;
+                    mismatches += 1;
+                }
+                t_pos += 1;
+                q_pos += 1;
+            }
+            AlignmentOperation::Del => {
+                t_pos += 1;
+            }
+            AlignmentOperation::Ins => {
+                if q_pos < oligo_len {
+                    sig[q_pos] = '-';
+                    mismatches += 1;
+                }
+                q_pos += 1;
+            }
+            AlignmentOperation::Xclip(_) => {}
+            AlignmentOperation::Yclip(_) => {}
+        }
+    }
+
+    mismatches += sig.iter().filter(|&&c| c == '-').count();
+
+    (sig.into_iter().collect(), mismatches)
+}
+
+/// Analyze a sequence against all oligos
+fn analyze_sequence(
+    sequence: &FastaRecord,
+    oligos: &[Oligo],
+    settings: &AlignmentSettings,
+) -> (HashMap<String, OligoResult>, usize, usize) {
+    let mut oligo_results = HashMap::new();
+    let mut total_matched = 0;
+    let mut total_mismatches = 0;
+
+    for oligo in oligos {
+        let (alignment_opt, orientation_opt, actual_oligo) =
+            get_best_alignment(&sequence.seq, &oligo.seq, settings);
+
+        let result = if let (Some(alignment), Some(orientation)) = (alignment_opt, orientation_opt)
+        {
+            if is_valid_alignment(&alignment, actual_oligo.len(), settings.min_coverage) {
+                let (signature, mismatches) =
+                    generate_signature(&alignment, &sequence.seq, &actual_oligo);
+                let coverage = get_alignment_coverage(&alignment, actual_oligo.len());
+
+                total_matched += 1;
+                total_mismatches += mismatches;
+
+                OligoResult {
+                    matched: true,
+                    orientation: Some(orientation),
+                    signature,
+                    mismatches,
+                    score: alignment.score,
+                    coverage,
+                }
+            } else {
+                OligoResult {
+                    matched: false,
+                    orientation: None,
+                    signature: String::new(),
+                    mismatches: 0,
+                    score: 0,
+                    coverage: 0.0,
+                }
+            }
+        } else {
+            OligoResult {
+                matched: false,
+                orientation: None,
+                signature: String::new(),
+                mismatches: 0,
+                score: 0,
+                coverage: 0.0,
+            }
+        };
+
+        oligo_results.insert(oligo.id.clone(), result);
+    }
+
+    (oligo_results, total_matched, total_mismatches)
+}
+
+/// Run the full analysis with parallel processing
+fn run_analysis(
+    sequences: &[FastaRecord],
+    oligos: &[Oligo],
+    settings: &AlignmentSettings,
+    progress: &ProgressTracker,
+) -> AnalysisResults {
+    let total_sequences = sequences.len();
+    progress.total.store(total_sequences, Ordering::SeqCst);
+    progress.current.store(0, Ordering::SeqCst);
+
+    let oligo_stats: HashMap<String, OligoStats> = oligos
+        .iter()
+        .map(|o| (o.id.clone(), OligoStats::default()))
+        .collect();
+    let oligo_stats = Arc::new(Mutex::new(oligo_stats));
+
+    let alignment_dict: Arc<Mutex<HashMap<String, PatternData>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let sequences_with_min_matches = Arc::new(AtomicUsize::new(0));
+
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    // Process sequences in parallel using rayon
+    sequences.par_iter().for_each(|record| {
+        if !progress.running.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let (oligo_results, matched_count, total_mismatches) =
+            analyze_sequence(record, oligos, settings);
+
+        // Update oligo stats
+        {
+            let mut stats = oligo_stats.lock().unwrap();
+            for (oligo_id, result) in &oligo_results {
+                if result.matched {
+                    if let Some(s) = stats.get_mut(oligo_id) {
+                        s.total_matches += 1;
+                        match result.orientation {
+                            Some(Orientation::Sense) => s.sense_matches += 1,
+                            Some(Orientation::Antisense) => s.antisense_matches += 1,
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if matched_count >= settings.min_oligos_matched {
+            sequences_with_min_matches.fetch_add(1, Ordering::SeqCst);
+
+            // Build combined signature
+            let mut signature_parts = Vec::new();
+            for oligo in oligos {
+                if let Some(result) = oligo_results.get(&oligo.id) {
+                    if result.matched {
+                        let orientation_symbol = match result.orientation {
+                            Some(Orientation::Sense) => "(fwd)",
+                            Some(Orientation::Antisense) => "(rev)",
+                            None => "",
+                        };
+                        signature_parts.push(format!("{}{}", result.signature, orientation_symbol));
+                    } else {
+                        signature_parts.push("NO_MATCH".to_string());
+                    }
+                } else {
+                    signature_parts.push("NO_MATCH".to_string());
+                }
+            }
+
+            let combined_signature = signature_parts.join(" | ");
+
+            // Update alignment dict
+            {
+                let mut dict = alignment_dict.lock().unwrap();
+                let entry = dict.entry(combined_signature).or_insert_with(|| PatternData {
+                    count: 0,
+                    total_mismatches,
+                    matched_oligos: matched_count,
+                    examples: Vec::new(),
+                });
+                entry.count += 1;
+                if entry.examples.len() < 10 {
+                    entry.examples.push(record.id.clone());
+                }
+            }
+        }
+
+        // Update progress
+        let current = processed.fetch_add(1, Ordering::SeqCst) + 1;
+        progress.current.store(current, Ordering::SeqCst);
+
+        if current % 100 == 0 || current == total_sequences {
+            if let Ok(mut status) = progress.status.lock() {
+                *status = format!("Processing sequence {}/{}", current, total_sequences);
+            }
+        }
+    });
+
+    let final_oligo_stats = oligo_stats.lock().unwrap().clone();
+    let final_alignment_dict = alignment_dict.lock().unwrap().clone();
+    let final_sequences_with_min_matches = sequences_with_min_matches.load(Ordering::SeqCst);
+
+    let output_text = generate_output_text(
+        oligos,
+        &final_oligo_stats,
+        &final_alignment_dict,
+        total_sequences,
+        final_sequences_with_min_matches,
+        settings,
+    );
+
+    AnalysisResults {
+        alignment_dict: final_alignment_dict,
+        oligo_stats: final_oligo_stats,
+        total_sequences,
+        sequences_with_min_matches: final_sequences_with_min_matches,
+        output_text,
+    }
+}
+
+/// Generate formatted output text
+fn generate_output_text(
+    oligos: &[Oligo],
+    oligo_stats: &HashMap<String, OligoStats>,
+    alignment_dict: &HashMap<String, PatternData>,
+    total_sequences: usize,
+    sequences_with_min_matches: usize,
+    settings: &AlignmentSettings,
+) -> String {
+    let mut out = Vec::new();
+
+    out.push("=".repeat(80));
+    out.push("ENHANCED qPCR ALIGNMENT ANALYSIS RESULTS".to_string());
+    out.push("=".repeat(80));
+    out.push(String::new());
+
+    let header_parts: Vec<String> = oligos
+        .iter()
+        .map(|o| format!("{}({})", o.id, o.seq))
+        .collect();
+    out.push(format!("Oligos analyzed: {}", header_parts.join(", ")));
+    out.push(format!(
+        "Analysis settings: Min matches = {}, Min coverage = {}",
+        settings.min_oligos_matched, settings.min_coverage
+    ));
+    out.push(String::new());
+
+    out.push("SEQUENCE SIGNATURE PATTERNS:".to_string());
+    out.push("-".repeat(50));
+
+    if !alignment_dict.is_empty() {
+        let mut sorted_patterns: Vec<_> = alignment_dict.iter().collect();
+        sorted_patterns.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+        for (signature, data) in sorted_patterns {
+            let mut examples_str = data.examples.iter().take(3).cloned().collect::<Vec<_>>();
+            if data.examples.len() > 3 {
+                examples_str.push(format!("... (+{} more)", data.examples.len() - 3));
+            }
+
+            out.push(format!("Pattern: {}", signature));
+            out.push(format!(
+                "  Count: {}, Mismatches: {}, Matched oligos: {}",
+                data.count, data.total_mismatches, data.matched_oligos
+            ));
+            out.push(format!("  Examples: {}", examples_str.join(", ")));
+            out.push(String::new());
+        }
+    } else {
+        out.push("No sequences met the minimum matching criteria.".to_string());
+        out.push(String::new());
+    }
+
+    out.push("PER-OLIGO STATISTICS:".to_string());
+    out.push("-".repeat(30));
+    for oligo in oligos {
+        if let Some(stats) = oligo_stats.get(&oligo.id) {
+            let percentage = if total_sequences > 0 {
+                (stats.total_matches as f64 / total_sequences as f64) * 100.0
+            } else {
+                0.0
+            };
+            out.push(format!(
+                "{}: {}/{} matches ({:.1}%) - Sense: {}, Antisense: {}",
+                oligo.id,
+                stats.total_matches,
+                total_sequences,
+                percentage,
+                stats.sense_matches,
+                stats.antisense_matches
+            ));
+        }
+    }
+
+    out.push(String::new());
+    out.push("SUMMARY:".to_string());
+    out.push("-".repeat(20));
+    out.push(format!("Total sequences analyzed: {}", total_sequences));
+    let percentage = if total_sequences > 0 {
+        (sequences_with_min_matches as f64 / total_sequences as f64) * 100.0
+    } else {
+        0.0
+    };
+    out.push(format!(
+        "Sequences with >={} matches: {} ({:.1}%)",
+        settings.min_oligos_matched, sequences_with_min_matches, percentage
+    ));
+    out.push(format!(
+        "Sequences with <{} matches: {}",
+        settings.min_oligos_matched,
+        total_sequences - sequences_with_min_matches
+    ));
+    out.push(String::new());
+    out.push("LEGEND:".to_string());
+    out.push("'(fwd)' = sense orientation, '(rev)' = antisense orientation".to_string());
+    out.push("'.' = match, letter = mismatch, '-' = gap/unaligned".to_string());
+    out.push("=".repeat(80));
+
+    out.join("\n")
+}
+
+// ============================================================================
+// GUI Application
+// ============================================================================
+
+/// Main application state
+struct PrimerAlignApp {
+    sequence_file: Option<PathBuf>,
+    oligo_file: Option<PathBuf>,
+    output_file: Option<PathBuf>,
+    settings: AlignmentSettings,
+    sequences: Vec<FastaRecord>,
+    oligos: Vec<Oligo>,
+    results: Option<AnalysisResults>,
+    progress: ProgressTracker,
+    show_advanced_settings: bool,
+    show_results_window: bool,
+    show_fasta_info: bool,
+    show_about: bool,
+    fasta_info_text: String,
+    status_message: String,
+    analysis_thread: Option<thread::JoinHandle<AnalysisResults>>,
+}
+
+impl Default for PrimerAlignApp {
+    fn default() -> Self {
+        Self {
+            sequence_file: None,
+            oligo_file: None,
+            output_file: None,
+            settings: AlignmentSettings::default(),
+            sequences: Vec::new(),
+            oligos: Vec::new(),
+            results: None,
+            progress: ProgressTracker::default(),
+            show_advanced_settings: false,
+            show_results_window: false,
+            show_fasta_info: false,
+            show_about: false,
+            fasta_info_text: String::new(),
+            status_message: "Ready".to_string(),
+            analysis_thread: None,
+        }
+    }
+}
+
+impl PrimerAlignApp {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        Self::default()
+    }
+
+    fn select_sequence_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("FASTA files", &["fasta", "fas", "fa", "fna"])
+            .add_filter("All files", &["*"])
+            .set_title("Select Sequence File")
+            .pick_file()
+        {
+            match parse_fasta(&path) {
+                Ok(records) => {
+                    self.sequences = records;
+                    self.sequence_file = Some(path);
+                    self.status_message = format!("Loaded {} sequences", self.sequences.len());
+                }
+                Err(e) => {
+                    self.status_message = format!("Error loading sequences: {}", e);
+                }
+            }
+        }
+    }
+
+    fn select_oligo_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("FASTA files", &["fasta", "fas", "fa", "fna"])
+            .add_filter("All files", &["*"])
+            .set_title("Select Oligo File")
+            .pick_file()
+        {
+            match parse_fasta(&path) {
+                Ok(records) => {
+                    self.oligos = records
+                        .into_iter()
+                        .map(|r| Oligo { id: r.id, seq: r.seq })
+                        .collect();
+                    self.oligo_file = Some(path);
+                    self.status_message = format!("Loaded {} oligos", self.oligos.len());
+                }
+                Err(e) => {
+                    self.status_message = format!("Error loading oligos: {}", e);
+                }
+            }
+        }
+    }
+
+    fn select_output_file(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("Text files", &["txt"])
+            .add_filter("All files", &["*"])
+            .set_title("Save Analysis Results As")
+            .save_file()
+        {
+            self.output_file = Some(path);
+            self.status_message = "Output file selected".to_string();
+        }
+    }
+
+    fn start_analysis(&mut self) {
+        if self.sequences.is_empty() {
+            self.status_message = "Please select a sequence file first".to_string();
+            return;
+        }
+        if self.oligos.is_empty() {
+            self.status_message = "Please select an oligo file first".to_string();
+            return;
+        }
+
+        let sequences = self.sequences.clone();
+        let oligos = self.oligos.clone();
+        let settings = self.settings.clone();
+        let progress = self.progress.clone();
+
+        self.progress.running.store(true, Ordering::SeqCst);
+        self.progress.current.store(0, Ordering::SeqCst);
+        self.progress.total.store(sequences.len(), Ordering::SeqCst);
+        if let Ok(mut status) = self.progress.status.lock() {
+            *status = "Starting analysis...".to_string();
+        }
+
+        let handle = thread::spawn(move || run_analysis(&sequences, &oligos, &settings, &progress));
+
+        self.analysis_thread = Some(handle);
+    }
+
+    fn check_analysis_complete(&mut self) {
+        if let Some(handle) = self.analysis_thread.take() {
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(results) => {
+                        self.results = Some(results);
+                        self.progress.running.store(false, Ordering::SeqCst);
+                        self.status_message = "Analysis complete!".to_string();
+                        self.show_results_window = true;
+
+                        if let Some(ref path) = self.output_file {
+                            if let Some(ref results) = self.results {
+                                if let Err(e) = std::fs::write(path, &results.output_text) {
+                                    self.status_message = format!("Error saving results: {}", e);
+                                } else {
+                                    self.status_message = format!(
+                                        "Results saved to {}",
+                                        path.file_name()
+                                            .map(|s| s.to_string_lossy().to_string())
+                                            .unwrap_or_default()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.progress.running.store(false, Ordering::SeqCst);
+                        self.status_message = "Analysis failed".to_string();
+                    }
+                }
+            } else {
+                self.analysis_thread = Some(handle);
+            }
+        }
+    }
+
+    fn show_fasta_info(&mut self) {
+        if self.sequences.is_empty() {
+            self.status_message = "Please select a sequence file first".to_string();
+            return;
+        }
+
+        let mut info = format!("FASTA File Information:\n{}\n\n", "=".repeat(30));
+        info.push_str(&format!("Total sequences: {}\n", self.sequences.len()));
+
+        if let Some(ref path) = self.sequence_file {
+            info.push_str(&format!(
+                "File: {}\n\n",
+                path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+        }
+
+        if !self.sequences.is_empty() {
+            let seq_lengths: Vec<usize> = self.sequences.iter().map(|r| r.seq.len()).collect();
+            let min_len = seq_lengths.iter().min().unwrap_or(&0);
+            let max_len = seq_lengths.iter().max().unwrap_or(&0);
+            let avg_len: f64 = seq_lengths.iter().sum::<usize>() as f64 / seq_lengths.len() as f64;
+
+            info.push_str("Sequence length statistics:\n");
+            info.push_str(&format!("  Min: {} bp\n", min_len));
+            info.push_str(&format!("  Max: {} bp\n", max_len));
+            info.push_str(&format!("  Average: {:.1} bp\n\n", avg_len));
+
+            info.push_str("First 5 sequence IDs:\n");
+            for (i, record) in self.sequences.iter().take(5).enumerate() {
+                info.push_str(&format!("  {}. {}\n", i + 1, record.id));
+            }
+        }
+
+        self.fasta_info_text = info;
+        self.show_fasta_info = true;
+    }
+
+    fn export_to_excel(&mut self) {
+        let results = match &self.results {
+            Some(r) => r,
+            None => {
+                self.status_message = "No results to export. Run analysis first.".to_string();
+                return;
+            }
+        };
+
+        if let Some(path) = FileDialog::new()
+            .add_filter("Excel files", &["xlsx"])
+            .set_title("Save Excel Results As")
+            .save_file()
+        {
+            match self.write_excel(&path, results) {
+                Ok(_) => {
+                    self.status_message = format!(
+                        "Excel export complete: {}",
+                        path.file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Error exporting Excel: {}", e);
+                }
+            }
+        }
+    }
+
+    fn write_excel(&self, path: &PathBuf, results: &AnalysisResults) -> Result<(), String> {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+
+        let header_format = Format::new().set_bold();
+        let title_format = Format::new().set_bold().set_font_size(14);
+
+        let mut row: u32 = 0;
+
+        // Title
+        worksheet
+            .write_string_with_format(row, 0, "qPCR Alignment Analysis Results", &title_format)
+            .map_err(|e| e.to_string())?;
+        row += 2;
+
+        // Settings
+        let oligo_info: Vec<String> = self
+            .oligos
+            .iter()
+            .map(|o| format!("{}({})", o.id, o.seq))
+            .collect();
+        worksheet
+            .write_string(row, 0, &format!("Oligos analyzed: {}", oligo_info.join(", ")))
+            .map_err(|e| e.to_string())?;
+        row += 1;
+        worksheet
+            .write_string(
+                row,
+                0,
+                &format!(
+                    "Settings: Min matches = {}, Min coverage = {}",
+                    self.settings.min_oligos_matched, self.settings.min_coverage
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        row += 3;
+
+        // Headers
+        let mut col: u16 = 0;
+        worksheet
+            .write_string_with_format(row, col, "Pattern #", &header_format)
+            .map_err(|e| e.to_string())?;
+        col += 1;
+
+        for oligo in &self.oligos {
+            worksheet
+                .write_string_with_format(row, col, &format!("{} Pattern", oligo.id), &header_format)
+                .map_err(|e| e.to_string())?;
+            col += 1;
+        }
+
+        worksheet
+            .write_string_with_format(row, col, "Count", &header_format)
+            .map_err(|e| e.to_string())?;
+        col += 1;
+        worksheet
+            .write_string_with_format(row, col, "Total Mismatches", &header_format)
+            .map_err(|e| e.to_string())?;
+        col += 1;
+        worksheet
+            .write_string_with_format(row, col, "Matched Oligos", &header_format)
+            .map_err(|e| e.to_string())?;
+        col += 1;
+        worksheet
+            .write_string_with_format(row, col, "Example Sequences", &header_format)
+            .map_err(|e| e.to_string())?;
+
+        row += 1;
+
+        // Data rows
+        let mut sorted_patterns: Vec<_> = results.alignment_dict.iter().collect();
+        sorted_patterns.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+        let mut pattern_num = 1u32;
+        for (signature, data) in sorted_patterns {
+            col = 0;
+            worksheet
+                .write_number(row, col, pattern_num as f64)
+                .map_err(|e| e.to_string())?;
+            col += 1;
+
+            let signature_parts: Vec<&str> = signature.split(" | ").collect();
+            for (i, _) in self.oligos.iter().enumerate() {
+                let pattern = signature_parts.get(i).unwrap_or(&"NO_MATCH");
+                worksheet
+                    .write_string(row, col, pattern.to_string())
+                    .map_err(|e| e.to_string())?;
+                col += 1;
+            }
+
+            worksheet
+                .write_number(row, col, data.count as f64)
+                .map_err(|e| e.to_string())?;
+            col += 1;
+            worksheet
+                .write_number(row, col, data.total_mismatches as f64)
+                .map_err(|e| e.to_string())?;
+            col += 1;
+            worksheet
+                .write_number(row, col, data.matched_oligos as f64)
+                .map_err(|e| e.to_string())?;
+            col += 1;
+
+            let examples: Vec<_> = data.examples.iter().take(3).collect();
+            let mut examples_str = examples
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if data.examples.len() > 3 {
+                examples_str.push_str(&format!(" (+{} more)", data.examples.len() - 3));
+            }
+            worksheet
+                .write_string(row, col, &examples_str)
+                .map_err(|e| e.to_string())?;
+
+            row += 1;
+            pattern_num += 1;
+        }
+
+        // Statistics
+        row += 2;
+        worksheet
+            .write_string_with_format(row, 0, "PER-OLIGO STATISTICS:", &header_format)
+            .map_err(|e| e.to_string())?;
+        row += 1;
+
+        for oligo in &self.oligos {
+            if let Some(stats) = results.oligo_stats.get(&oligo.id) {
+                let percentage = if results.total_sequences > 0 {
+                    (stats.total_matches as f64 / results.total_sequences as f64) * 100.0
+                } else {
+                    0.0
+                };
+                worksheet
+                    .write_string(
+                        row,
+                        0,
+                        &format!(
+                            "{}: {}/{} matches ({:.1}%) - Sense: {}, Antisense: {}",
+                            oligo.id,
+                            stats.total_matches,
+                            results.total_sequences,
+                            percentage,
+                            stats.sense_matches,
+                            stats.antisense_matches
+                        ),
+                    )
+                    .map_err(|e| e.to_string())?;
+                row += 1;
+            }
+        }
+
+        // Summary
+        row += 1;
+        worksheet
+            .write_string_with_format(row, 0, "SUMMARY:", &header_format)
+            .map_err(|e| e.to_string())?;
+        row += 1;
+        worksheet
+            .write_string(
+                row,
+                0,
+                &format!("Total sequences analyzed: {}", results.total_sequences),
+            )
+            .map_err(|e| e.to_string())?;
+        row += 1;
+
+        let percentage = if results.total_sequences > 0 {
+            (results.sequences_with_min_matches as f64 / results.total_sequences as f64) * 100.0
+        } else {
+            0.0
+        };
+        worksheet
+            .write_string(
+                row,
+                0,
+                &format!(
+                    "Sequences with >={} matches: {} ({:.1}%)",
+                    self.settings.min_oligos_matched, results.sequences_with_min_matches, percentage
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+
+        workbook.save(path).map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    fn reset_defaults(&mut self) {
+        self.settings = AlignmentSettings::default();
+    }
+}
+
+impl eframe::App for PrimerAlignApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_analysis_complete();
+
+        if self.progress.running.load(Ordering::SeqCst) {
+            ctx.request_repaint();
+        }
+
+        // Menu bar
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Select Sequence File...").clicked() {
+                        self.select_sequence_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("Select Oligo File...").clicked() {
+                        self.select_oligo_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("Set Output File...").clicked() {
+                        self.select_output_file();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Export to Excel...").clicked() {
+                        self.export_to_excel();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("FASTA Info").clicked() {
+                        self.show_fasta_info();
+                        ui.close_menu();
+                    }
+                    if ui.button("Advanced Settings...").clicked() {
+                        self.show_advanced_settings = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        self.show_about = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
+        // Status bar
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let status = if self.progress.running.load(Ordering::SeqCst) {
+                    self.progress
+                        .status
+                        .lock()
+                        .map(|s| s.clone())
+                        .unwrap_or_else(|_| "Processing...".to_string())
+                } else {
+                    self.status_message.clone()
+                };
+                ui.label(&status);
+            });
+        });
+
+        // Main content
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("qPCR Primer Alignment Tool");
+            ui.label("High-performance primer inclusivity analysis using Rust");
+            ui.add_space(10.0);
+
+            // File selection group
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Input Files").strong());
+                ui.add_space(5.0);
+
+                egui::Grid::new("file_grid").num_columns(3).show(ui, |ui| {
+                    ui.label("Sequence File:");
+                    if ui.button("Browse...").clicked() {
+                        self.select_sequence_file();
+                    }
+                    if let Some(ref path) = self.sequence_file {
+                        ui.colored_label(
+                            egui::Color32::DARK_GREEN,
+                            format!(
+                                "✓ {} ({} sequences)",
+                                path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                                self.sequences.len()
+                            ),
+                        );
+                    } else {
+                        ui.label("No file selected");
+                    }
+                    ui.end_row();
+
+                    ui.label("Oligo File:");
+                    if ui.button("Browse...").clicked() {
+                        self.select_oligo_file();
+                    }
+                    if let Some(ref path) = self.oligo_file {
+                        ui.colored_label(
+                            egui::Color32::DARK_GREEN,
+                            format!(
+                                "✓ {} ({} oligos)",
+                                path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                                self.oligos.len()
+                            ),
+                        );
+                    } else {
+                        ui.label("No file selected");
+                    }
+                    ui.end_row();
+
+                    ui.label("Output File:");
+                    if ui.button("Browse...").clicked() {
+                        self.select_output_file();
+                    }
+                    if let Some(ref path) = self.output_file {
+                        ui.colored_label(
+                            egui::Color32::DARK_GREEN,
+                            format!(
+                                "✓ {}",
+                                path.file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            ),
+                        );
+                    } else {
+                        ui.label("No file selected (optional)");
+                    }
+                    ui.end_row();
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // Quick settings group
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Quick Settings").strong());
+                ui.add_space(5.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Min Oligos Matched:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.min_oligos_matched)
+                            .range(1..=100)
+                            .speed(0.1),
+                    );
+
+                    ui.add_space(20.0);
+
+                    ui.label("Min Coverage:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.min_coverage)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .max_decimals(2),
+                    );
+
+                    ui.add_space(20.0);
+
+                    if ui.button("Advanced Settings...").clicked() {
+                        self.show_advanced_settings = true;
+                    }
+                });
+            });
+
+            ui.add_space(15.0);
+
+            // Action buttons
+            ui.horizontal(|ui| {
+                let is_running = self.progress.running.load(Ordering::SeqCst);
+
+                ui.add_enabled_ui(!is_running, |ui| {
+                    if ui
+                        .button(egui::RichText::new("▶ Run Analysis").strong())
+                        .clicked()
+                    {
+                        self.start_analysis();
+                    }
+                });
+
+                ui.add_enabled_ui(!is_running, |ui| {
+                    if ui.button("💾 File Only").clicked() {
+                        if self.output_file.is_none() {
+                            self.status_message = "Please select an output file first".to_string();
+                        } else {
+                            self.start_analysis();
+                        }
+                    }
+                });
+
+                if ui.button("📊 FASTA Info").clicked() {
+                    self.show_fasta_info();
+                }
+
+                if ui.button("📈 Export Excel").clicked() {
+                    self.export_to_excel();
+                }
+
+                if is_running {
+                    ui.add_space(10.0);
+                    if ui.button("⏹ Stop").clicked() {
+                        self.progress.running.store(false, Ordering::SeqCst);
+                    }
+                    ui.spinner();
+                }
+            });
+
+            ui.add_space(15.0);
+
+            // Progress group
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Progress").strong());
+                let current = self.progress.current.load(Ordering::SeqCst);
+                let total = self.progress.total.load(Ordering::SeqCst);
+                let progress = if total > 0 {
+                    current as f32 / total as f32
+                } else {
+                    0.0
+                };
+
+                ui.add(egui::ProgressBar::new(progress).show_percentage());
+                
+                if total > 0 {
+                    ui.label(format!("{} / {} sequences processed", current, total));
+                }
+            });
+
+            // Show oligo preview if loaded
+            if !self.oligos.is_empty() {
+                ui.add_space(15.0);
+                ui.collapsing("Loaded Oligos", |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for oligo in &self.oligos {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&oligo.id);
+                                    ui.label(":");
+                                    ui.monospace(&oligo.seq);
+                                });
+                            }
+                        });
+                });
+            }
+        });
+
+        // Advanced settings window
+        if self.show_advanced_settings {
+            egui::Window::new("Advanced Settings")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading("Alignment Parameters");
+                    ui.add_space(10.0);
+
+                    egui::Grid::new("settings_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("Alignment Mode:");
+                        egui::ComboBox::from_id_salt("mode")
+                            .selected_text(match self.settings.mode {
+                                AlignmentMode::Local => "Local",
+                                AlignmentMode::Global => "Global",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.mode,
+                                    AlignmentMode::Local,
+                                    "Local",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.mode,
+                                    AlignmentMode::Global,
+                                    "Global",
+                                );
+                            });
+                        ui.end_row();
+
+                        ui.label("Match Score:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.match_score)
+                                .range(-10..=10)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Mismatch Score:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.mismatch_score)
+                                .range(-10..=10)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Gap Open Score:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.gap_open_score)
+                                .range(-20..=0)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Gap Extend Score:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.gap_extend_score)
+                                .range(-10..=0)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Min Coverage:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.min_coverage)
+                                .range(0.0..=1.0)
+                                .speed(0.01)
+                                .max_decimals(2),
+                        );
+                        ui.end_row();
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset to Defaults").clicked() {
+                            self.reset_defaults();
+                        }
+                        if ui.button("OK").clicked() {
+                            self.show_advanced_settings = false;
+                        }
+                    });
+                });
+        }
+
+        // Results window
+        if self.show_results_window {
+            egui::Window::new("Analysis Results")
+                .default_size([800.0, 600.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("💾 Save Text").clicked() {
+                            if let Some(ref results) = self.results {
+                                if let Some(path) = FileDialog::new()
+                                    .add_filter("Text files", &["txt"])
+                                    .set_title("Save Results")
+                                    .save_file()
+                                {
+                                    if let Err(e) = std::fs::write(&path, &results.output_text) {
+                                        self.status_message = format!("Error saving: {}", e);
+                                    } else {
+                                        self.status_message = "Results saved".to_string();
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("📈 Export Excel").clicked() {
+                            self.export_to_excel();
+                        }
+                        if ui.button("Close").clicked() {
+                            self.show_results_window = false;
+                        }
+                    });
+
+                    ui.separator();
+
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        if let Some(ref results) = self.results {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut results.output_text.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                    });
+                });
+        }
+
+        // FASTA info window
+        if self.show_fasta_info {
+            egui::Window::new("FASTA Information")
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    if ui.button("Close").clicked() {
+                        self.show_fasta_info = false;
+                    }
+                    ui.separator();
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.fasta_info_text.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                });
+        }
+
+        // About window
+        if self.show_about {
+            egui::Window::new("About")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading("qPCR Primer Alignment Tool");
+                    ui.label("Version 1.0.0");
+                    ui.add_space(10.0);
+                    ui.label("A high-performance primer inclusivity analysis tool");
+                    ui.label("built with Rust and rust-bio.");
+                    ui.add_space(10.0);
+                    ui.label("Features:");
+                    ui.label("• Bidirectional primer alignment (sense/antisense)");
+                    ui.label("• Flexible matching criteria");
+                    ui.label("• Parallel processing with Rayon");
+                    ui.label("• Excel export support");
+                    ui.label("• Progress tracking");
+                    ui.add_space(10.0);
+                    if ui.button("OK").clicked() {
+                        self.show_about = false;
+                    }
+                });
+        }
+    }
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 700.0])
+            .with_min_inner_size([600.0, 400.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "qPCR Primer Alignment Tool",
+        options,
+        Box::new(|cc| Ok(Box::new(PrimerAlignApp::new(cc)))),
+    )
+}
