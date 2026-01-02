@@ -406,8 +406,28 @@ fn generate_signature(
             }
             AlignmentOperation::Subst => {
                 if q_pos < oligo_len && t_pos < target_bytes.len() {
-                    sig[q_pos] = target_bytes[t_pos] as char;
-                    mismatches += 1;
+                    let target_base = target_bytes[t_pos];
+                    let oligo_base = oligo_bytes[q_pos];
+                    
+                    // Check if this is actually an IUPAC ambiguity match
+                    // (rust-bio marks it as Subst because characters differ,
+                    // but our scoring function treated it as a match)
+                    if iupac_match(target_base, oligo_base) {
+                        // It's an ambiguity match
+                        match ambiguity_display {
+                            AmbiguityDisplayMode::ShowDots => {
+                                sig[q_pos] = '.';
+                            }
+                            AmbiguityDisplayMode::ShowBases => {
+                                sig[q_pos] = target_base as char;
+                                mismatches += 1;
+                            }
+                        }
+                    } else {
+                        // True mismatch
+                        sig[q_pos] = target_base as char;
+                        mismatches += 1;
+                    }
                 }
                 t_pos += 1;
                 q_pos += 1;
