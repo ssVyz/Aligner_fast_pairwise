@@ -148,6 +148,63 @@ impl Default for ProgressTracker {
 // Bioinformatics Functions
 // ============================================================================
 
+/// Check if two nucleotides match considering IUPAC ambiguity codes
+/// Returns true if they match, false otherwise
+/// N always returns false (mismatch) regardless of the other base
+fn iupac_match(a: u8, b: u8) -> bool {
+    let a_upper = a.to_ascii_uppercase();
+    let b_upper = b.to_ascii_uppercase();
+    
+    // N always mismatches
+    if a_upper == b'N' || b_upper == b'N' {
+        return false;
+    }
+    
+    // Exact match
+    if a_upper == b_upper {
+        return true;
+    }
+    
+    // Define IUPAC ambiguity codes and their possible bases
+    let get_bases = |code: u8| -> &'static [u8] {
+        match code.to_ascii_uppercase() {
+            b'A' => &[b'A'],
+            b'T' => &[b'T'],
+            b'G' => &[b'G'],
+            b'C' => &[b'C'],
+            b'U' => &[b'U'],
+            b'R' => &[b'A', b'G'], // purine
+            b'Y' => &[b'C', b'T'], // pyrimidine
+            b'S' => &[b'G', b'C'],
+            b'W' => &[b'A', b'T'],
+            b'K' => &[b'G', b'T'],
+            b'M' => &[b'A', b'C'],
+            b'B' => &[b'C', b'G', b'T'], // not A
+            b'D' => &[b'A', b'G', b'T'], // not C
+            b'H' => &[b'A', b'C', b'T'], // not G
+            b'V' => &[b'A', b'C', b'G'], // not T
+            _ => &[], // unknown character, no match
+        }
+    };
+    
+    let a_bases = get_bases(a_upper);
+    let b_bases = get_bases(b_upper);
+    
+    // Check if there's any overlap between the two sets of possible bases
+    for &base_a in a_bases {
+        for &base_b in b_bases {
+            // Normalize U to T for comparison
+            let normalized_a = if base_a == b'U' { b'T' } else { base_a };
+            let normalized_b = if base_b == b'U' { b'T' } else { base_b };
+            if normalized_a == normalized_b {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
 /// Get reverse complement of a DNA sequence
 fn reverse_complement(seq: &str) -> String {
     seq.chars()
@@ -208,7 +265,7 @@ fn get_best_alignment(
         settings.gap_open_score,
         settings.gap_extend_score,
         |a: u8, b: u8| {
-            if a == b {
+            if iupac_match(a, b) {
                 settings.match_score
             } else {
                 settings.mismatch_score
@@ -283,10 +340,12 @@ fn get_alignment_coverage(alignment: &bio::alignment::Alignment, oligo_len: usiz
 }
 
 /// Generate signature from alignment
+/// For reverse orientation hits, the pattern is reversed to match the original oligo orientation
 fn generate_signature(
     alignment: &bio::alignment::Alignment,
     target_seq: &str,
     oligo_seq: &str,
+    orientation: Orientation,
 ) -> (String, usize) {
     let oligo_len = oligo_seq.len();
     let mut sig: Vec<char> = vec!['-'; oligo_len];
@@ -331,7 +390,40 @@ fn generate_signature(
 
     mismatches += sig.iter().filter(|&&c| c == '-').count();
 
-    (sig.into_iter().collect(), mismatches)
+    let mut signature: String = sig.into_iter().collect();
+    
+    // For reverse orientation, reverse complement mismatch letters and reverse the signature
+    // to match original oligo orientation
+    if orientation == Orientation::Antisense {
+        // Reverse complement any nucleotide letters in the signature (mismatches)
+        signature = signature
+            .chars()
+            .map(|c| {
+                match c.to_ascii_uppercase() {
+                    'A' => 'T',
+                    'T' => 'A',
+                    'G' => 'C',
+                    'C' => 'G',
+                    'U' => 'A',
+                    'R' => 'Y', // A|G -> C|T
+                    'Y' => 'R', // C|T -> A|G
+                    'S' => 'S', // G|C -> C|G (same set)
+                    'W' => 'W', // A|T -> T|A (same set)
+                    'K' => 'M', // G|T -> A|C
+                    'M' => 'K', // A|C -> G|T
+                    'B' => 'V', // C|G|T -> A|C|G
+                    'D' => 'H', // A|G|T -> A|C|T
+                    'H' => 'D', // A|C|T -> A|G|T
+                    'V' => 'B', // A|C|G -> C|G|T
+                    _ => c, // Keep dots, dashes, and other characters as-is
+                }
+            })
+            .collect();
+        // Reverse the entire signature string
+        signature = signature.chars().rev().collect();
+    }
+
+    (signature, mismatches)
 }
 
 /// Analyze a sequence against all oligos
@@ -352,7 +444,7 @@ fn analyze_sequence(
         {
             if is_valid_alignment(&alignment, actual_oligo.len(), settings.min_coverage) {
                 let (signature, mismatches) =
-                    generate_signature(&alignment, &sequence.seq, &actual_oligo);
+                    generate_signature(&alignment, &sequence.seq, &actual_oligo, orientation);
                 let coverage = get_alignment_coverage(&alignment, actual_oligo.len());
 
                 total_matched += 1;
